@@ -1,0 +1,21 @@
+[package]
+name = "just-logging"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-queue = "0.3.11"
+log = "0.4.17"
+chrono = "0.4.42"
+
+[dependencies.atomic-wait]
+git = "https://github.com/Grimeh/atomic-wait"
+branch = "shared"
+#path = "../third_party/atomic-wait"
+
+[dependencies.log-panics]
+#version = "2.1.0"
+#path = "../rust-log-panics"
+git = "https://github.com/Grimeh/rust-log-panics"
+branch = "add_flush"
+features = ["with-backtrace", "flush"]

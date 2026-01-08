@@ -1,0 +1,6 @@
+target/
+.idea/
+*.swp
+.DS_Store
+*.log
+*.log.prev

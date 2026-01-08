@@ -1,0 +1,296 @@
+#![feature(sync_unsafe_cell)]
+
+use crossbeam_queue::SegQueue;
+use log::{error, Level, LevelFilter, Log, Metadata, Record};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{LazyLock, Mutex, RwLock};
+use std::{fs, panic, thread};
+
+#[macro_export]
+macro_rules! clog {
+	($verb:ident, $condition:expr, $($next:tt),+) => {
+		if $condition {
+			::log::$verb!($($next),+);
+		}
+	};
+}
+
+/// Conditional trace log macro
+///
+/// Logs at trace level if the supplied condition is true
+#[macro_export]
+macro_rules! ctrace {
+	($condition:expr, $next:tt) => {
+		$crate::clog!(trace, $condition, $next);
+	};
+}
+
+/// Conditional debug log macro
+///
+/// Logs at debug level if the supplied condition is true
+#[macro_export]
+macro_rules! cdebug {
+	($condition:expr, $next:tt) => {
+		$crate::clog!(debug, $condition, $next);
+	};
+}
+
+/// Conditional info log macro
+///
+/// Logs at info level if the supplied condition is true
+#[macro_export]
+macro_rules! cinfo {
+	($condition:expr, $next:tt) => {
+		$crate::clog!(debug, $condition, $next);
+	};
+}
+
+/// Conditional warning macro
+///
+/// Logs a warning if the supplied condition is true
+#[macro_export]
+macro_rules! cwarn {
+	($condition:expr, $next:tt) => {
+		$crate::clog!(warn, $condition, $next);
+	};
+}
+
+/// Conditional error macro
+///
+/// Logs an error if the supplied condition is true
+#[macro_export]
+macro_rules! cerror {
+	($condition:expr, $($next:tt),+) => {
+		$crate::clog!(error, $condition, $($next),+);
+	};
+}
+
+const MODULE_BLACKLIST: &'static [(&'static str, LevelFilter)] = &[
+	("ignore::", LevelFilter::Warn),
+	("globset", LevelFilter::Warn),
+	("notify::", LevelFilter::Warn),
+];
+
+const LOG_PREV_SUFFIX: &str = "prev";
+
+pub static JUSTLOG: LazyLock<JustLog> = LazyLock::new(|| JustLog {
+	enabled: AtomicU8::new(0),
+	msg_count: AtomicU32::new(0),
+	queue: SegQueue::new(),
+	file: Mutex::new(None),
+	module_levels: RwLock::new(Vec::new()),
+	timestamps_enabled: true,
+});
+
+struct LogEntry {
+	pub level: Level,
+	pub msg: String,
+}
+
+#[repr(u8)]
+enum EnabledState {
+	Disabled = 0,
+	Initialising = 1,
+	Enabled = 2,
+}
+
+struct ModFilter {
+	module: String,
+	level: LevelFilter,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum LogError {
+	CachePoisoned,
+}
+
+pub struct JustLog {
+	enabled: AtomicU8,
+
+	msg_count: AtomicU32,
+	queue: SegQueue<LogEntry>,
+	file: Mutex<Option<File>>,
+
+	module_levels: RwLock<Vec<ModFilter>>,
+	timestamps_enabled: bool,
+}
+
+impl JustLog {
+	pub fn spawn_log_thread(log_path: Option<&Path>, default_level: LevelFilter) {
+		JUSTLOG.init(log_path);
+		assert_eq!(JUSTLOG.enabled.load(Ordering::Relaxed), EnabledState::Enabled as u8);
+
+		log::set_max_level(default_level);
+		log::set_logger(&*JUSTLOG).unwrap();
+
+		// redirect panics to logger
+		log_panics::init();
+
+		thread::Builder::new()
+			.name("ah_logger".to_string())
+			.spawn(|| {
+				match panic::catch_unwind(|| {
+					let logger = &*JUSTLOG;
+					loop {
+						atomic_wait::wait(&logger.msg_count, 0);
+						logger.flush();
+					}
+				}) {
+					Ok(()) => {},
+					Err(_) => {
+						error!("log thread panicked!");
+					}
+				}
+			}).unwrap();
+	}
+
+	pub fn set_module_log_level(module: &str, level: LevelFilter) {
+		let this = &*JUSTLOG;
+		assert_eq!(this.enabled.load(Ordering::Relaxed), EnabledState::Enabled as u8);
+
+		let mut levels = this.module_levels.write().unwrap();
+		for filter in levels.iter_mut() {
+			if module.starts_with(&filter.module) {
+				filter.level = level;
+				return;
+			}
+		}
+
+		// didn't find, add
+		levels.push(ModFilter {
+			module: module.to_string(),
+			level,
+		});
+	}
+
+	fn init(&self, log_path: Option<&Path>) {
+		let exc = self.enabled.compare_exchange(
+			EnabledState::Disabled as u8,
+			EnabledState::Initialising as u8,
+			Ordering::Acquire,
+			Ordering::Relaxed
+		);
+
+		{
+			let mut bl = self.module_levels.write().unwrap();
+			for (name, level) in MODULE_BLACKLIST {
+				bl.push(ModFilter {
+					module: name.to_string(),
+					level: *level,
+				});
+			}
+		}
+
+		if exc.is_ok() {
+			if let Some(path) = log_path {
+				let mut file = self.file.lock().unwrap();
+				*file = open_log(path);
+			}
+
+			self.enabled.compare_exchange(
+				EnabledState::Initialising as u8,
+				EnabledState::Enabled as u8,
+				Ordering::Relaxed,
+				Ordering::Relaxed
+			).unwrap();
+		}
+	}
+}
+
+impl Log for JustLog {
+	fn enabled(&self, metadata: &Metadata) -> bool {
+		metadata.level() <= Level::Trace
+	}
+
+	fn log(&self, record: &Record) {
+		if record.target() == "panic" {
+			// immediately print to stderr for convenience
+			eprintln!("{}", record.args());
+		}
+
+		if self.enabled(record.metadata()) {
+			let module = record.module_path().unwrap_or("NONE");
+
+			let levels = self.module_levels.read().unwrap();
+			for filter in levels.iter() {
+				if module.starts_with(&filter.module) {
+					if record.level() >= filter.level {
+						return;
+					}
+				}
+			}
+			drop(levels);
+
+			let msg = if self.timestamps_enabled {
+				let now = chrono::Local::now();
+				let now = now.format("%y%m%d-%H:%M:%S.%3f").to_string();
+				format!("{} [{}] {} - {}", now, module, record.level(), record.args())
+			} else {
+				format!("[{}] {} - {}", module, record.level(), record.args())
+			};
+
+			self.queue.push(LogEntry {
+				level: record.level(),
+				msg,
+			});
+
+			self.msg_count.fetch_add(1, Ordering::Relaxed);
+			atomic_wait::wake_one(&self.msg_count as *const _);
+		}
+	}
+
+	fn flush(&self) {
+		while self.msg_count.load(Ordering::Relaxed) > 0 {
+			let mut f = self.file.lock().unwrap();
+
+			while let Some(msg) = self.queue.pop() {
+				self.msg_count.fetch_sub(1, Ordering::Relaxed);
+
+				if msg.level > Level::Error {
+					println!("{}", msg.msg);
+				} else {
+					eprintln!("{}", msg.msg);
+				}
+
+				match &mut *f {
+					Some(f) => {
+						write!(f, "{}\n", msg.msg).unwrap();
+					}
+					None => {}
+				}
+			}
+		}
+	}
+}
+
+fn open_log(path: &Path) -> Option<File> {
+	let cwd = std::env::current_dir().ok()?;
+	let path = cwd.join(path);
+
+	if let Some(parent) = path.parent() {
+		if !parent.exists() {
+			fs::create_dir_all(parent).ok()?;
+		} else {
+			// roll log if it exists
+			roll_log(&path);
+		}
+	}
+
+	// `create` will truncate if the file exists
+	File::create(path).ok()
+}
+
+fn roll_log(path: &Path) -> Option<()> {
+	if fs::exists(path).ok()? {
+		let prev_path = path.with_added_extension(LOG_PREV_SUFFIX);
+		if fs::exists(&prev_path).ok()? {
+			fs::remove_file(&prev_path).ok()?;
+		}
+		fs::rename(path, prev_path).ok()?;
+	}
+
+	Some(())
+}
