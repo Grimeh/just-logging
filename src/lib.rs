@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
-use std::{fs, panic, thread};
+use std::{fs, io, panic, thread};
 
 #[macro_export]
 macro_rules! clog {
@@ -119,7 +119,7 @@ pub struct JustLog {
 }
 
 impl JustLog {
-	pub fn spawn_log_thread(log_path: Option<&Path>, default_level: LevelFilter) {
+	pub fn spawn_log_thread(log_path: Option<&Path>, default_level: LevelFilter) -> io::Result<thread::JoinHandle<()>> {
 		JUSTLOG.init(log_path);
 		assert_eq!(JUSTLOG.enabled.load(Ordering::Relaxed), EnabledState::Enabled as u8);
 
@@ -140,11 +140,11 @@ impl JustLog {
 					}
 				}) {
 					Ok(()) => {},
-					Err(_) => {
-						error!("log thread panicked!");
+					Err(err) => {
+						error!("log thread panicked! {:?}", err);
 					}
 				}
-			}).unwrap();
+			})
 	}
 
 	pub fn set_module_log_level(module: &str, level: LevelFilter) {
@@ -267,8 +267,14 @@ impl Log for JustLog {
 }
 
 fn open_log(path: &Path) -> Option<File> {
-	let cwd = std::env::current_dir().ok()?;
-	let path = cwd.join(path);
+	let path = {
+		if path.is_absolute() {
+			path.to_owned()
+		} else {
+			let cwd = std::env::current_dir().ok()?;
+			cwd.join(path)
+		}
+	};
 
 	if let Some(parent) = path.parent() {
 		if !parent.exists() {
