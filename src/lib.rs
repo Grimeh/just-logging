@@ -95,6 +95,7 @@ enum EnabledState {
 	Disabled = 0,
 	Initialising = 1,
 	Enabled = 2,
+	ShuttingDown = 3,
 }
 
 struct ModFilter {
@@ -135,6 +136,10 @@ impl JustLog {
 				match panic::catch_unwind(|| {
 					let logger = &*JUSTLOG;
 					loop {
+						if logger.enabled.load(Ordering::Relaxed) == EnabledState::ShuttingDown as u8 {
+							break;
+						}
+
 						atomic_wait::wait(&logger.msg_count, 0);
 						logger.flush();
 					}
@@ -164,6 +169,12 @@ impl JustLog {
 			module: module.to_string(),
 			level,
 		});
+	}
+
+	pub fn shutdown() {
+		let this = &*JUSTLOG;
+		this.enabled.store(EnabledState::ShuttingDown as u8, Ordering::Relaxed);
+		atomic_wait::wake_all(&this.msg_count as *const _);
 	}
 
 	fn init(&self, log_path: Option<&Path>) {
