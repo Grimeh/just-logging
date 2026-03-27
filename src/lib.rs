@@ -1,4 +1,5 @@
 #![feature(sync_unsafe_cell)]
+#![feature(result_option_map_or_default)]
 
 use crossbeam_queue::SegQueue;
 use log::{error, Level, LevelFilter, Log, Metadata, Record};
@@ -83,10 +84,17 @@ pub static JUSTLOG: LazyLock<JustLog> = LazyLock::new(|| JustLog {
 	file: Mutex::new(None),
 	module_levels: RwLock::new(Vec::new()),
 	timestamps_enabled: true,
+	additional_sinks: Mutex::new(Vec::new()),
 });
 
-struct LogEntry {
+pub struct LogEntry {
+	pub module: String,
 	pub level: Level,
+	pub timestamp: Option<String>,
+
+	pub filename: String,
+	pub line: u32,
+
 	pub msg: String,
 }
 
@@ -108,6 +116,8 @@ pub enum LogError {
 	CachePoisoned,
 }
 
+pub type FnSink = dyn FnMut(&LogEntry) + Send + Sync;
+
 pub struct JustLog {
 	enabled: AtomicU8,
 
@@ -117,6 +127,8 @@ pub struct JustLog {
 
 	module_levels: RwLock<Vec<ModFilter>>,
 	timestamps_enabled: bool,
+
+	additional_sinks: Mutex<Vec<Box<FnSink>>>,
 }
 
 impl JustLog {
@@ -169,6 +181,12 @@ impl JustLog {
 			module: module.to_string(),
 			level,
 		});
+	}
+
+	pub fn add_sink(sink: Box<FnSink>) {
+		let this = &*JUSTLOG;
+		let mut sinks = this.additional_sinks.lock().unwrap();
+		sinks.push(sink);
 	}
 
 	pub fn shutdown() {
@@ -225,27 +243,35 @@ impl Log for JustLog {
 		if self.enabled(record.metadata()) {
 			let module = record.module_path().unwrap_or("NONE");
 
-			let levels = self.module_levels.read().unwrap();
-			for filter in levels.iter() {
-				if module.starts_with(&filter.module) {
-					if record.level() >= filter.level {
-						return;
+			{
+				let levels = self.module_levels.read().unwrap();
+				for filter in levels.iter() {
+					if module.starts_with(&filter.module) {
+						if record.level() >= filter.level {
+							return;
+						}
 					}
 				}
 			}
-			drop(levels);
 
-			let msg = if self.timestamps_enabled {
+			let timestamp = if self.timestamps_enabled {
 				let now = chrono::Local::now();
 				let now = now.format("%y%m%d-%H:%M:%S.%3f").to_string();
-				format!("{} [{}] {} - {}", now, module, record.level(), record.args())
+				Some(now)
 			} else {
-				format!("[{}] {} - {}", module, record.level(), record.args())
+				None
 			};
 
+			let filename = record.file().map_or_default(|f| f.to_string());
+			let line = record.line().unwrap_or_default();
+
 			self.queue.push(LogEntry {
+				module: module.to_string(),
 				level: record.level(),
-				msg,
+				timestamp,
+				filename,
+				line,
+				msg: record.args().to_string(),
 			});
 
 			self.msg_count.fetch_add(1, Ordering::Relaxed);
@@ -256,19 +282,33 @@ impl Log for JustLog {
 	fn flush(&self) {
 		while self.msg_count.load(Ordering::Relaxed) > 0 {
 			let mut f = self.file.lock().unwrap();
+			let mut additional = self.additional_sinks.lock().unwrap();
 
-			while let Some(msg) = self.queue.pop() {
+			while let Some(entry) = self.queue.pop() {
 				self.msg_count.fetch_sub(1, Ordering::Relaxed);
 
-				if msg.level > Level::Error {
-					println!("{}", msg.msg);
+				for s in &mut *additional {
+					s(&entry);
+				}
+
+				let msg = match entry.timestamp {
+					Some(ts) => {
+						format!("{} [{}] {} - {}", ts, entry.module, entry.level, entry.msg)
+					}
+					None => {
+						format!("[{}] {} - {}", entry.module, entry.level, entry.msg)
+					}
+				};
+
+				if entry.level > Level::Error {
+					println!("{}", msg);
 				} else {
-					eprintln!("{}", msg.msg);
+					eprintln!("{}", msg);
 				}
 
 				match &mut *f {
 					Some(f) => {
-						write!(f, "{}\n", msg.msg).unwrap();
+						write!(f, "{}\n", msg).unwrap();
 					}
 					None => {}
 				}
