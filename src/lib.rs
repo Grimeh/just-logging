@@ -9,10 +9,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::{fs, io, panic, thread};
+use std::backtrace::{Backtrace, BacktraceStatus};
 
 #[macro_export]
 macro_rules! clog {
-	($verb:ident, $condition:expr, $($next:tt),+) => {
+	($verb:ident, $condition:expr, $($next:expr),+) => {
 		if $condition {
 			::log::$verb!($($next),+);
 		}
@@ -64,7 +65,7 @@ macro_rules! cwarn {
 /// Logs an error if the supplied condition is true
 #[macro_export]
 macro_rules! cerror {
-	($condition:expr, $($next:tt),+) => {
+	($condition:expr, $($next:expr),+) => {
 		$crate::clog!(error, $condition, $($next),+);
 	};
 }
@@ -96,6 +97,8 @@ pub struct LogEntry {
 	pub line: u32,
 
 	pub msg: String,
+
+	pub backtrace: Option<Backtrace>,
 }
 
 #[repr(u8)]
@@ -265,6 +268,21 @@ impl Log for JustLog {
 			let filename = record.file().map_or_default(|f| f.to_string());
 			let line = record.line().unwrap_or_default();
 
+			let backtrace = if cfg!(feature = "backtrace") {
+				if record.level() == Level::Error {
+					let bt = Backtrace::force_capture();
+					if bt.status() == BacktraceStatus::Captured {
+						Some(bt)
+					} else {
+						None
+					}
+				} else {
+					None
+				}
+			} else {
+				None
+			};
+
 			self.queue.push(LogEntry {
 				module: module.to_string(),
 				level: record.level(),
@@ -272,6 +290,7 @@ impl Log for JustLog {
 				filename,
 				line,
 				msg: record.args().to_string(),
+				backtrace,
 			});
 
 			self.msg_count.fetch_add(1, Ordering::Relaxed);
@@ -293,10 +312,19 @@ impl Log for JustLog {
 
 				let msg = match entry.timestamp {
 					Some(ts) => {
-						format!("{} [{}] {} - {}", ts, entry.module, entry.level, entry.msg)
+						match entry.backtrace {
+							Some(bt) => {
+								format!("{} [{}] {} - {}\n{}", ts, entry.module, entry.level, entry.msg, bt)
+							}
+							None => format!("{} [{}] {} - {}", ts, entry.module, entry.level, entry.msg),
+						}
 					}
 					None => {
-						format!("[{}] {} - {}", entry.module, entry.level, entry.msg)
+						match entry.backtrace {
+							Some(bt) => format!("[{}] {} - {}\n{}", entry.module, entry.level, entry.msg, bt),
+							None => format!("[{}] {} - {}", entry.module, entry.level, entry.msg),
+						}
+
 					}
 				};
 

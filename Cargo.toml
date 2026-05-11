@@ -8,6 +8,10 @@ crossbeam-queue = "0.3.11"
 log = "0.4.17"
 chrono = "0.4.42"
 
+[features]
+default = []
+backtrace = []
+
 [dependencies.atomic-wait]
 git = "https://github.com/Grimeh/atomic-wait"
 branch = "shared"
