@@ -195,7 +195,7 @@ impl JustLog {
 	pub fn shutdown() {
 		let this = &*JUSTLOG;
 		this.enabled.store(EnabledState::ShuttingDown as u8, Ordering::Relaxed);
-		atomic_wait::wake_all(&this.msg_count as *const _);
+		atomic_wait::wake_all(&this.msg_count);
 	}
 
 	fn init(&self, log_path: Option<&Path>) {
@@ -294,7 +294,7 @@ impl Log for JustLog {
 			});
 
 			self.msg_count.fetch_add(1, Ordering::Relaxed);
-			atomic_wait::wake_one(&self.msg_count as *const _);
+			atomic_wait::wake_one(&self.msg_count);
 		}
 	}
 

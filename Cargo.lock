@@ -29,7 +29,7 @@ dependencies = [
 [[package]]
 name = "atomic-wait"
 version = "1.1.0"
-source = "git+https://github.com/Grimeh/atomic-wait?branch=shared#4a8e5ccc53fe1455a367b3b97366718d03b08f29"
+source = "git+https://github.com/Grimeh/atomic-wait?branch=shared#d449f6c6069ce457d3e6fd5006d337244f1e180e"
 dependencies = [
  "cfg-if",
  "libc",
