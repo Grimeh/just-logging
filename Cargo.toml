@@ -15,11 +15,8 @@ backtrace = []
 [dependencies.atomic-wait]
 git = "https://github.com/Grimeh/atomic-wait"
 branch = "shared"
-#path = "../third_party/atomic-wait"
 
 [dependencies.log-panics]
-#version = "2.1.0"
-#path = "../rust-log-panics"
 git = "https://github.com/Grimeh/rust-log-panics"
 branch = "add_flush"
 features = ["with-backtrace", "flush"]

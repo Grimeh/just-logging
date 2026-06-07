@@ -1,4 +1,3 @@
-#![feature(sync_unsafe_cell)]
 #![feature(result_option_map_or_default)]
 
 use crossbeam_queue::SegQueue;
