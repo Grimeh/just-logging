@@ -5,7 +5,7 @@ use log::{error, Level, LevelFilter, Log, Metadata, Record};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::{fs, io, panic, thread};
 use std::backtrace::{Backtrace, BacktraceStatus};
@@ -79,6 +79,7 @@ const LOG_PREV_SUFFIX: &str = "prev";
 
 pub static JUSTLOG: LazyLock<JustLog> = LazyLock::new(|| JustLog {
 	enabled: AtomicU8::new(0),
+	max_level: AtomicUsize::new(LevelFilter::Trace as usize),
 	msg_count: AtomicU32::new(0),
 	queue: SegQueue::new(),
 	file: Mutex::new(None),
@@ -122,6 +123,7 @@ pub type FnSink = dyn FnMut(&LogEntry) + Send + Sync;
 
 pub struct JustLog {
 	enabled: AtomicU8,
+	max_level: AtomicUsize,
 
 	msg_count: AtomicU32,
 	queue: SegQueue<LogEntry>,
@@ -138,7 +140,8 @@ impl JustLog {
 		JUSTLOG.init(log_path);
 		assert_eq!(JUSTLOG.enabled.load(Ordering::Relaxed), EnabledState::Enabled as u8);
 
-		log::set_max_level(default_level);
+		JUSTLOG.max_level.store(default_level as usize, Ordering::Relaxed);
+		// log::set_max_level(default_level);
 		log::set_logger(&*JUSTLOG).unwrap();
 
 		// redirect panics to logger
@@ -198,12 +201,12 @@ impl JustLog {
 	}
 
 	fn init(&self, log_path: Option<&Path>) {
-		let exc = self.enabled.compare_exchange(
+		self.enabled.compare_exchange(
 			EnabledState::Disabled as u8,
 			EnabledState::Initialising as u8,
 			Ordering::Acquire,
 			Ordering::Relaxed
-		);
+		).expect("invalid JustLog init state");
 
 		{
 			let mut bl = self.module_levels.write().unwrap();
@@ -215,19 +218,17 @@ impl JustLog {
 			}
 		}
 
-		if exc.is_ok() {
-			if let Some(path) = log_path {
-				let mut file = self.file.lock().unwrap();
-				*file = open_log(path);
-			}
-
-			self.enabled.compare_exchange(
-				EnabledState::Initialising as u8,
-				EnabledState::Enabled as u8,
-				Ordering::Relaxed,
-				Ordering::Relaxed
-			).unwrap();
+		if let Some(path) = log_path {
+			let mut file = self.file.lock().unwrap();
+			*file = open_log(path);
 		}
+
+		self.enabled.compare_exchange(
+			EnabledState::Initialising as u8,
+			EnabledState::Enabled as u8,
+			Ordering::Relaxed,
+			Ordering::Relaxed
+		).expect("JustLog init race detected");
 	}
 }
 
@@ -242,59 +243,66 @@ impl Log for JustLog {
 			eprintln!("{}", record.args());
 		}
 
-		if self.enabled(record.metadata()) {
-			let module = record.module_path().unwrap_or("NONE");
+		let module = record.module_path().unwrap_or("NONE");
 
-			{
-				let levels = self.module_levels.read().unwrap();
-				for filter in levels.iter() {
-					if module.starts_with(&filter.module) {
-						if record.level() >= filter.level {
-							return;
-						}
-					}
+		// check against module filter rules
+		let mut passed = false;
+		let levels = self.module_levels.read().unwrap();
+		for filter in levels.iter() {
+			if module.starts_with(&filter.module) {
+				if record.level() >= filter.level {
+					// failing any rules discards the record
+					return;
 				}
+				passed = true;
 			}
+		}
 
-			let timestamp = if self.timestamps_enabled {
-				let now = chrono::Local::now();
-				let now = now.format("%y%m%d-%H:%M:%S.%3f").to_string();
-				Some(now)
-			} else {
-				None
-			};
+		// fallback to global max level if no module filter rules were passed
+		if !passed {
+			if record.level() as usize >= self.max_level.load(Ordering::Relaxed) {
+				return;
+			}
+		}
 
-			let filename = record.file().map_or_default(|f| f.to_string());
-			let line = record.line().unwrap_or_default();
+		let timestamp = if self.timestamps_enabled {
+			let now = chrono::Local::now();
+			let now = now.format("%y%m%d-%H:%M:%S.%3f").to_string();
+			Some(now)
+		} else {
+			None
+		};
 
-			let backtrace = if cfg!(feature = "backtrace") {
-				if record.level() == Level::Error {
-					let bt = Backtrace::force_capture();
-					if bt.status() == BacktraceStatus::Captured {
-						Some(bt)
-					} else {
-						None
-					}
+		let filename = record.file().map_or_default(|f| f.to_string());
+		let line = record.line().unwrap_or_default();
+
+		let backtrace = if cfg!(feature = "backtrace") {
+			if record.level() == Level::Error {
+				let bt = Backtrace::force_capture();
+				if bt.status() == BacktraceStatus::Captured {
+					Some(bt)
 				} else {
 					None
 				}
 			} else {
 				None
-			};
+			}
+		} else {
+			None
+		};
 
-			self.queue.push(LogEntry {
-				module: module.to_string(),
-				level: record.level(),
-				timestamp,
-				filename,
-				line,
-				msg: record.args().to_string(),
-				backtrace,
-			});
+		self.queue.push(LogEntry {
+			module: module.to_string(),
+			level: record.level(),
+			timestamp,
+			filename,
+			line,
+			msg: record.args().to_string(),
+			backtrace,
+		});
 
-			self.msg_count.fetch_add(1, Ordering::Relaxed);
-			atomic_wait::wake_one(&self.msg_count);
-		}
+		self.msg_count.fetch_add(1, Ordering::Relaxed);
+		atomic_wait::wake_one(&self.msg_count);
 	}
 
 	fn flush(&self) {
