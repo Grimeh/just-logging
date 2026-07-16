@@ -250,7 +250,7 @@ impl Log for JustLog {
 		let levels = self.module_levels.read().unwrap();
 		for filter in levels.iter() {
 			if module.starts_with(&filter.module) {
-				if record.level() >= filter.level {
+				if record.level() > filter.level {
 					// failing any rules discards the record
 					return;
 				}
