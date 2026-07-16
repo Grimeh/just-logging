@@ -260,7 +260,7 @@ impl Log for JustLog {
 
 		// fallback to global max level if no module filter rules were passed
 		if !passed {
-			if record.level() as usize >= self.max_level.load(Ordering::Relaxed) {
+			if record.level() as usize > self.max_level.load(Ordering::Relaxed) {
 				return;
 			}
 		}
